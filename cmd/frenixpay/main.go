@@ -146,7 +146,7 @@ func main() {
 
 	merchantLimiter := ratelimit.NewLimiter(redisClient, cfg.MerchantRateLimitPerMinute, time.Minute, logger)
 	publicLimiter := ratelimit.NewLimiter(redisClient, cfg.PublicRateLimitPerMinute, time.Minute, logger)
-	router := api.NewRouter(ordersSvc, merchantSvc, merchantLimiter, publicLimiter, logger)
+	router := api.NewRouter(ordersSvc, merchantSvc, chainMgr, merchantLimiter, publicLimiter, logger)
 
 	httpServer := &http.Server{
 		Addr:         cfg.HTTPAddr,

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/hiren223344/frpay/internal/chains"
 	"github.com/hiren223344/frpay/internal/merchant"
 	"github.com/hiren223344/frpay/internal/orders"
 )
@@ -17,11 +18,44 @@ import (
 type Handlers struct {
 	orders   *orders.Service
 	merchant *merchant.Service
+	chainMgr *chains.Manager
 	logger   *slog.Logger
 }
 
-func NewHandlers(ordersSvc *orders.Service, merchantSvc *merchant.Service, logger *slog.Logger) *Handlers {
-	return &Handlers{orders: ordersSvc, merchant: merchantSvc, logger: logger}
+func NewHandlers(ordersSvc *orders.Service, merchantSvc *merchant.Service, chainMgr *chains.Manager, logger *slog.Logger) *Handlers {
+	return &Handlers{orders: ordersSvc, merchant: merchantSvc, chainMgr: chainMgr, logger: logger}
+}
+
+// chainLabels gives each supported chain a customer-facing display name.
+// Adding a new chain to internal/chains only requires an entry here for
+// it to show up in the public chain list — no other API change needed.
+var chainLabels = map[chains.Chain]string{
+	chains.Tron:     "TRON (TRC20)",
+	chains.Ethereum: "Ethereum (ERC20)",
+	chains.BSC:      "BNB Smart Chain (BEP20)",
+	chains.Polygon:  "Polygon",
+}
+
+// ListChains handles GET /v1/chains. Public: it's configuration, not a
+// secret, and the checkout page needs it before any order (and thus any
+// merchant auth) exists.
+func (h *Handlers) ListChains(w http.ResponseWriter, r *http.Request) {
+	out := make([]chainInfo, 0, len(h.chainMgr.Chains()))
+	for _, c := range h.chainMgr.Chains() {
+		required, _ := h.chainMgr.RequiredConfirmations(c)
+		label := chainLabels[c]
+		if label == "" {
+			label = string(c)
+		}
+		out = append(out, chainInfo{
+			Chain:                 string(c),
+			Label:                 label,
+			Token:                 "USDT",
+			Decimals:              6,
+			RequiredConfirmations: required,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {

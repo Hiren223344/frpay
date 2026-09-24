@@ -33,3 +33,11 @@ type registerWebhookResponse struct {
 type errorResponse struct {
 	Error string `json:"error"`
 }
+
+type chainInfo struct {
+	Chain                 string `json:"chain"`
+	Label                 string `json:"label"`
+	Token                 string `json:"token"`
+	Decimals              int32  `json:"decimals"`
+	RequiredConfirmations int64  `json:"required_confirmations"`
+}

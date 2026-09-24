@@ -72,6 +72,19 @@ func authMiddleware(svc *merchant.Service, logger *slog.Logger) func(http.Handle
 	}
 }
 
+// corsPublicGET allows any origin to read this route. Only applied to
+// the two unauthenticated, secret-free GET endpoints a checkout page's
+// browser JS polls directly (see router.go) — never to anything
+// merchant-authenticated. A plain cross-origin GET with no custom
+// headers is a CORS "simple request", so no preflight OPTIONS request
+// needs handling here.
+func corsPublicGET(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // rateLimitMiddleware rejects requests once the caller (identified by
 // keyFunc) exceeds the configured rate.
 func rateLimitMiddleware(limiter *ratelimit.Limiter, keyFunc func(*http.Request) string) func(http.Handler) http.Handler {

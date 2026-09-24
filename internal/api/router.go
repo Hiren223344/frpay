@@ -8,13 +8,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hiren223344/frpay/internal/chains"
 	"github.com/hiren223344/frpay/internal/merchant"
 	"github.com/hiren223344/frpay/internal/orders"
 	"github.com/hiren223344/frpay/internal/ratelimit"
 )
 
-func NewRouter(ordersSvc *orders.Service, merchantSvc *merchant.Service, merchantLimiter, publicLimiter *ratelimit.Limiter, logger *slog.Logger) http.Handler {
-	h := NewHandlers(ordersSvc, merchantSvc, logger)
+func NewRouter(ordersSvc *orders.Service, merchantSvc *merchant.Service, chainMgr *chains.Manager, merchantLimiter, publicLimiter *ratelimit.Limiter, logger *slog.Logger) http.Handler {
+	h := NewHandlers(ordersSvc, merchantSvc, chainMgr, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
@@ -26,8 +27,21 @@ func NewRouter(ordersSvc *orders.Service, merchantSvc *merchant.Service, merchan
 	r.Get("/healthz", h.Health)
 
 	r.Route("/v1", func(r chi.Router) {
-		r.With(rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr })).
-			Get("/orders/{orderID}", h.GetOrder)
+		// These two endpoints carry no secret and are meant to be polled
+		// directly by a checkout page's browser JS, which is typically
+		// served from the merchant's own origin (not this service's) —
+		// so they're open to any origin. Every other route stays
+		// same-origin/server-to-server only; CORS is deliberately not
+		// enabled globally.
+		r.With(
+			corsPublicGET,
+			rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr }),
+		).Get("/orders/{orderID}", h.GetOrder)
+
+		r.With(
+			corsPublicGET,
+			rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr }),
+		).Get("/chains", h.ListChains)
 
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware(merchantSvc, logger))

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout · Frenix Pay</title>
+<link rel="icon" href="data:,">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+  <div class="panel">
+
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" id="brandMark">A</div>
+        <span id="merchantName">Acme Studio</span>
+      </div>
+      <div class="amount-block">
+        <span class="label">Amount due</span>
+        <span class="amount" id="amountUSD">$0.00</span>
+        <span class="mono muted" id="amountCrypto">&nbsp;</span>
+      </div>
+      <div class="lineitems" id="lineItems"></div>
+      <div class="timer-box" id="timerBox" hidden>
+        <div class="timer-row">
+          <span class="muted">Address expires in</span>
+          <span class="mono" id="timerLabel">--:--</span>
+        </div>
+        <div class="timer-track"><div class="timer-fill" id="timerFill"></div></div>
+        <span class="mono faint" id="orderMeta">&nbsp;</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="main-inner">
+
+        <div class="steps" id="steps"></div>
+
+        <!-- select network -->
+        <section id="stepSelect" class="step" hidden>
+          <div class="heading">
+            <h1>Choose a network</h1>
+            <p class="muted">You'll pay in USDT. Pick the network you want to send it on.</p>
+          </div>
+          <div class="network-list" id="networkList"></div>
+          <button class="btn-primary" id="continueBtn" disabled>Continue</button>
+          <p class="error-text" id="selectError" hidden></p>
+        </section>
+
+        <!-- creating -->
+        <section id="stepCreating" class="step" hidden>
+          <div class="heading">
+            <h1>Preparing your deposit address</h1>
+            <p class="muted">One moment&hellip;</p>
+          </div>
+        </section>
+
+        <!-- send -->
+        <section id="stepSend" class="step" hidden>
+          <div class="heading-row">
+            <div class="heading">
+              <h1>Send USDT</h1>
+              <p class="muted">on <span id="sendNetwork"></span></p>
+            </div>
+          </div>
+
+          <div class="qr-wrap"><div id="qrHolder"></div></div>
+
+          <div class="detail-card">
+            <div class="detail-row">
+              <span class="detail-text">
+                <span class="detail-label">Exact amount</span>
+                <span class="mono detail-value" id="sendAmount"></span>
+              </span>
+              <button class="btn-copy" id="copyAmountBtn" type="button">Copy</button>
+            </div>
+            <div class="detail-row">
+              <span class="detail-text">
+                <span class="detail-label">Address</span>
+                <span class="mono detail-value break" id="sendAddress"></span>
+              </span>
+              <button class="btn-copy" id="copyAddressBtn" type="button">Copy</button>
+            </div>
+          </div>
+
+          <p class="warning-text">Only send USDT on <span id="sendNetwork2"></span>. Sending any other asset, or on any other network, cannot be recovered.</p>
+
+          <p class="muted small">This page updates automatically once payment is detected on-chain — you don't need to do anything else.</p>
+        </section>
+
+        <!-- confirming -->
+        <section id="stepConfirming" class="step" hidden>
+          <div class="heading">
+            <h1>Confirming payment</h1>
+            <p class="muted">Waiting for the network to finalize your transaction. Keep this page open.</p>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="confProgress"></div></div>
+          <span class="mono muted" id="confLabel"></span>
+          <p class="mono faint small" id="confTxHash"></p>
+        </section>
+
+        <!-- confirmed -->
+        <section id="stepConfirmed" class="step" hidden>
+          <div class="success-block">
+            <div class="success-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"></path></svg>
+            </div>
+            <div class="heading">
+              <h1>Payment complete</h1>
+              <p class="muted" id="confirmedText"></p>
+            </div>
+            <div class="receipt-card">
+              <div class="receipt-row"><span class="muted">Network</span><span id="receiptNetwork"></span></div>
+              <div class="receipt-row"><span class="muted">Transaction</span><span class="mono" id="receiptTx"></span></div>
+              <div class="receipt-row"><span class="muted">Status</span><span class="settled">Settled</span></div>
+            </div>
+            <div class="btn-row">
+              <button class="btn-primary small-btn" id="returnBtn" type="button">Return to merchant</button>
+              <button class="btn-secondary small-btn" id="resetBtn" type="button">Start over</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- expired -->
+        <section id="stepExpired" class="step" hidden>
+          <div class="heading">
+            <h1>This deposit address expired</h1>
+            <p class="muted">No payment was detected before the window closed. No funds were lost if nothing was sent — start a new order to get a fresh address.</p>
+          </div>
+          <button class="btn-primary" id="restartBtn" type="button">Start a new order</button>
+        </section>
+
+        <!-- error -->
+        <section id="stepError" class="step" hidden>
+          <div class="heading">
+            <h1>Something went wrong</h1>
+            <p class="muted" id="errorText">Please try again.</p>
+          </div>
+          <button class="btn-primary" id="retryBtn" type="button">Try again</button>
+        </section>
+
+        <div class="footer-note">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          Non-custodial · Powered by Frenix Pay
+        </div>
+      </div>
+    </main>
+
+  </div>
+</div>
+
+<script src="vendor/qrcode.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

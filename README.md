@@ -27,6 +27,8 @@ internal/
   wallet/                watch-only BIP44 address derivation
   webhook/               HMAC-signed outbound delivery with retry
 migrations/              golang-migrate SQL schema
+cmd/democheckout        reference merchant backend for the checkout demo below
+web/checkout             static checkout page for cmd/democheckout to serve
 ```
 
 ## Design choices
@@ -155,6 +157,59 @@ delivery to that URL the same way: `X-Frenix-Signature` /
 polling `GET /v1/orders/{order_id}` remains available as a fallback for
 merchants who don't register a webhook, or whose endpoint is down past
 the retry budget.
+
+### `GET /v1/chains` (public)
+
+Lists the chains currently enabled, for populating a network picker
+without hardcoding it client-side:
+
+```json
+[{ "chain": "tron", "label": "TRON (TRC20)", "token": "USDT", "decimals": 6, "required_confirmations": 20 }]
+```
+
+## Checkout demo (`cmd/democheckout` + `web/checkout`)
+
+A working reference checkout page, wired to the real API above — not a
+mockup. It demonstrates the integration pattern every Frenix product
+should follow:
+
+- **`POST /v1/orders` is merchant-authenticated and must never be called
+  from a browser** — the HMAC secret can't be exposed client-side.
+  `cmd/democheckout` stands in for a real merchant backend (e.g.
+  frenix-back-v3): it holds the API key/secret server-side, signs and
+  creates the order when the customer picks a network, and hands the
+  browser back just the `order_id`.
+- From there, `web/checkout`'s JS only ever talks to two things: the
+  demo backend's own `/checkout/create-order` (same-origin), and Frenix
+  Pay's public `GET /v1/orders/{id}` / `GET /v1/chains` directly
+  (cross-origin — these two routes send `Access-Control-Allow-Origin: *`
+  specifically because they're meant to be polled by a checkout page
+  hosted on the merchant's own domain, not this service's).
+- Everything shown is live: the network list, the derived deposit
+  address and QR code (rendered client-side with a vendored copy of
+  [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator),
+  MIT-licensed, no CDN dependency), the countdown to the order's real
+  `expires_at`, and confirmation progress — all driven by polling the
+  order every few seconds and rendering whatever status comes back
+  (`pending` → `confirming` → `confirmed`, or `expired`).
+
+Run it alongside `frenixpay`:
+
+```bash
+make build
+./bin/frenixpay -create-merchant="Acme Studio"   # note the API key + secret
+
+FRENIXPAY_API_KEY=fp_live_...
+FRENIXPAY_API_SECRET=...
+FRENIXPAY_BASE_URL=http://localhost:8080
+LISTEN_ADDR=:8090
+go build -o bin/democheckout ./cmd/democheckout && ./bin/democheckout
+```
+
+Then open `http://localhost:8090/?amount=249.00`. `amount`, `merchant`
+and `item` are query params for demo purposes; a real integration would
+set those server-side when the merchant backend renders/redirects to the
+page instead.
 
 ## Security notes
 
