@@ -1,77 +1,88 @@
 // Package chains defines the common interface every blockchain watcher
-// implements. Adding a new chain to Frenix Pay means writing one
-// ChainWatcher implementation in a new subpackage and registering it in
-// main — nothing in internal/orders or internal/api needs to change.
+// implements. Each chain has exactly ONE fixed receiving address,
+// configured once — not one per order — so a watcher's only job is to
+// continuously scan that address and report every incoming USDT
+// transfer it sees. Matching a transfer to a pending order by amount is
+// the orders package's job, not the watcher's, which is what keeps
+// adding a new chain down to "implement this interface" with no changes
+// to internal/orders or internal/api.
 package chains
 
 import (
 	"context"
-	"math/big"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
+
+// PendingTransfer seeds a watcher's in-flight confirmation tracking for
+// a transfer it already reported before a restart (an order still in
+// "confirming"), so confirmations keep accumulating without needing to
+// rediscover the transaction from a cursor that has already moved past
+// it.
+type PendingTransfer struct {
+	TxHash      string
+	Amount      decimal.Decimal
+	BlockHeight int64
+}
 
 // Chain identifies a supported network. Values match the `chain` column
 // in the orders table.
 type Chain string
 
 const (
-	Tron     Chain = "tron"
-	Ethereum Chain = "ethereum"
-	BSC      Chain = "bsc"
-	Polygon  Chain = "polygon"
+	Tron    Chain = "tron"
+	TON     Chain = "ton"
+	Polygon Chain = "polygon"
+	BSC     Chain = "bsc"
 )
 
-// DepositEvent is emitted whenever a watcher observes a USDT transfer to
-// an address it is watching, and again on every subsequent poll while the
-// transaction is still accumulating confirmations. Sinks (the orders
-// service) must treat delivery as at-least-once and handle duplicates by
-// (Chain, TxHash) idempotently.
-type DepositEvent struct {
-	Chain         Chain
-	ToAddress     string
-	TxHash        string
-	Amount        *big.Int // raw token amount, smallest unit (e.g. 6dp for TRC20/most ERC20 USDT)
-	TokenDecimals int32
+// TransferEvent is emitted whenever a watcher observes a USDT transfer
+// to its chain's fixed address, and again on every subsequent poll while
+// it's still accumulating confirmations. Sinks (the orders service) must
+// treat delivery as at-least-once and handle duplicates by (Chain,
+// TxHash) idempotently.
+type TransferEvent struct {
+	Chain Chain
+	// TxHash uniquely identifies the transfer on its chain.
+	TxHash string
+	// Amount is the human-readable USDT amount (already adjusted for the
+	// token's on-chain decimals), since USDT is treated as pegged 1:1 to
+	// USD throughout this service.
+	Amount        decimal.Decimal
 	BlockHeight   int64
 	Confirmations int64
 	ObservedAt    time.Time
 }
 
-// DepositSink receives deposit events from every watcher. Implemented by
-// internal/orders.Service. Watchers never import the orders package —
+// TransferSink receives transfer events from every watcher. Implemented
+// by internal/orders.Service. Watchers never import the orders package —
 // this interface is the only coupling, and it points the other way, so
-// chain implementations stay reusable independent of order logic.
-type DepositSink interface {
-	OnDeposit(ctx context.Context, event DepositEvent) error
+// chain implementations stay reusable independent of order-matching
+// logic.
+type TransferSink interface {
+	OnTransfer(ctx context.Context, event TransferEvent) error
 }
 
 // ChainWatcher is implemented once per network. A watcher only ever
-// reads chain state; it has no access to any key capable of spending
-// funds.
+// reads chain state against its one configured address; it has no
+// access to any key capable of spending funds.
 type ChainWatcher interface {
 	// Chain identifies which network this watcher serves.
 	Chain() Chain
 
 	// RequiredConfirmations is the confirmation count this chain's
-	// config requires before a deposit is considered final.
+	// config requires before a transfer is considered final.
 	RequiredConfirmations() int64
 
-	// WatchAddress registers a deposit address to watch. Idempotent:
-	// watching an address already being watched is a no-op.
-	WatchAddress(ctx context.Context, address string) error
-
-	// UnwatchAddress stops watching an address (called on order expiry
-	// or confirmation, to bound the watch set to active orders).
-	UnwatchAddress(ctx context.Context, address string) error
-
-	// SeedConfirming primes in-flight confirmation tracking for an order
-	// that already has a detected transaction (e.g. reloaded from the DB
-	// after a restart), so confirmations keep accumulating without
-	// re-scanning from genesis to rediscover it.
-	SeedConfirming(ctx context.Context, address, txHash string, blockHeight int64) error
+	// SeedPending primes in-flight confirmation tracking for a transfer
+	// already known (e.g. reloaded from the DB after a restart), so
+	// confirmations keep accumulating for it even though the watcher's
+	// scan cursor has already moved past the block it was detected in.
+	SeedPending(ctx context.Context, transfer PendingTransfer) error
 
 	// Run starts the watcher's polling loop and blocks until ctx is
-	// cancelled or an unrecoverable error occurs. Deposits are reported
-	// through the DepositSink supplied at construction.
+	// cancelled or an unrecoverable error occurs. Transfers are reported
+	// through the TransferSink supplied at construction.
 	Run(ctx context.Context) error
 }

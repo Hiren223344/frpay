@@ -9,13 +9,12 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/hiren223344/frpay/internal/chains"
-	"github.com/hiren223344/frpay/internal/merchant"
 	"github.com/hiren223344/frpay/internal/orders"
 	"github.com/hiren223344/frpay/internal/ratelimit"
 )
 
-func NewRouter(ordersSvc *orders.Service, merchantSvc *merchant.Service, chainMgr *chains.Manager, merchantLimiter, publicLimiter *ratelimit.Limiter, logger *slog.Logger) http.Handler {
-	h := NewHandlers(ordersSvc, merchantSvc, chainMgr, logger)
+func NewRouter(ordersSvc *orders.Service, chainMgr *chains.Manager, addresses map[chains.Chain]string, apiKey string, ordersLimiter, publicLimiter *ratelimit.Limiter, logger *slog.Logger) http.Handler {
+	h := NewHandlers(ordersSvc, chainMgr, addresses, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
@@ -27,34 +26,19 @@ func NewRouter(ordersSvc *orders.Service, merchantSvc *merchant.Service, chainMg
 	r.Get("/healthz", h.Health)
 
 	r.Route("/v1", func(r chi.Router) {
-		// These two endpoints carry no secret and are meant to be polled
-		// directly by a checkout page's browser JS, which is typically
-		// served from the merchant's own origin (not this service's) —
-		// so they're open to any origin. Every other route stays
-		// same-origin/server-to-server only; CORS is deliberately not
-		// enabled globally.
-		r.With(
-			corsPublicGET,
-			rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr }),
-		).Get("/orders/{orderID}", h.GetOrder)
+		// Public, secret-free: meant to be polled directly by a
+		// customer-facing frontend, possibly cross-origin.
+		r.With(corsPublicGET, rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr })).
+			Get("/orders/{orderID}", h.GetOrder)
+		r.With(corsPublicGET, rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr })).
+			Get("/chains", h.ListChains)
 
+		// Order creation is server-to-server only: guarded by the shared
+		// API key, never called from a browser.
 		r.With(
-			corsPublicGET,
-			rateLimitMiddleware(publicLimiter, func(r *http.Request) string { return r.RemoteAddr }),
-		).Get("/chains", h.ListChains)
-
-		r.Group(func(r chi.Router) {
-			r.Use(authMiddleware(merchantSvc, logger))
-			r.Use(rateLimitMiddleware(merchantLimiter, func(r *http.Request) string {
-				m := merchantFromContext(r.Context())
-				if m == nil {
-					return r.RemoteAddr
-				}
-				return m.ID.String()
-			}))
-			r.Post("/orders", h.CreateOrder)
-			r.Post("/webhooks/register", h.RegisterWebhook)
-		})
+			apiKeyMiddleware(apiKey),
+			rateLimitMiddleware(ordersLimiter, func(r *http.Request) string { return r.RemoteAddr }),
+		).Post("/orders", h.CreateOrder)
 	})
 
 	return r

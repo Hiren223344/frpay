@@ -41,13 +41,3 @@ func addressToTopic(address string) string {
 	addr := strings.ToLower(strings.TrimPrefix(address, "0x"))
 	return "0x" + strings.Repeat("0", 24) + addr
 }
-
-// topicToAddress extracts the lowercase 0x-address from a 32-byte topic
-// value (the last 20 bytes / 40 hex chars).
-func topicToAddress(topic string) string {
-	t := strings.TrimPrefix(topic, "0x")
-	if len(t) < 40 {
-		return "0x" + t
-	}
-	return "0x" + strings.ToLower(t[len(t)-40:])
-}

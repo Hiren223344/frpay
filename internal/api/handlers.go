@@ -4,52 +4,41 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"net/url"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
 	"github.com/hiren223344/frpay/internal/chains"
-	"github.com/hiren223344/frpay/internal/merchant"
 	"github.com/hiren223344/frpay/internal/orders"
 )
 
 type Handlers struct {
-	orders   *orders.Service
-	merchant *merchant.Service
-	chainMgr *chains.Manager
-	logger   *slog.Logger
+	orders    *orders.Service
+	chainMgr  *chains.Manager
+	addresses map[chains.Chain]string
+	logger    *slog.Logger
 }
 
-func NewHandlers(ordersSvc *orders.Service, merchantSvc *merchant.Service, chainMgr *chains.Manager, logger *slog.Logger) *Handlers {
-	return &Handlers{orders: ordersSvc, merchant: merchantSvc, chainMgr: chainMgr, logger: logger}
+func NewHandlers(ordersSvc *orders.Service, chainMgr *chains.Manager, addresses map[chains.Chain]string, logger *slog.Logger) *Handlers {
+	return &Handlers{orders: ordersSvc, chainMgr: chainMgr, addresses: addresses, logger: logger}
 }
 
-// chainLabels gives each supported chain a customer-facing display name.
-// Adding a new chain to internal/chains only requires an entry here for
-// it to show up in the public chain list — no other API change needed.
-var chainLabels = map[chains.Chain]string{
-	chains.Tron:     "TRON (TRC20)",
-	chains.Ethereum: "Ethereum (ERC20)",
-	chains.BSC:      "BNB Smart Chain (BEP20)",
-	chains.Polygon:  "Polygon",
+func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// ListChains handles GET /v1/chains. Public: it's configuration, not a
-// secret, and the checkout page needs it before any order (and thus any
-// merchant auth) exists.
+// ListChains handles GET /v1/chains. Public: these are the fixed
+// receiving addresses, not a secret, and a client needs them before it
+// can even show a "choose a network" step.
 func (h *Handlers) ListChains(w http.ResponseWriter, r *http.Request) {
-	out := make([]chainInfo, 0, len(h.chainMgr.Chains()))
-	for _, c := range h.chainMgr.Chains() {
+	enabled := h.chainMgr.Chains()
+	out := make([]chainInfo, 0, len(enabled))
+	for _, c := range enabled {
 		required, _ := h.chainMgr.RequiredConfirmations(c)
-		label := chainLabels[c]
-		if label == "" {
-			label = string(c)
-		}
 		out = append(out, chainInfo{
 			Chain:                 string(c),
-			Label:                 label,
+			Address:               h.addresses[c],
 			Token:                 "USDT",
 			Decimals:              6,
 			RequiredConfirmations: required,
@@ -58,44 +47,31 @@ func (h *Handlers) ListChains(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// CreateOrder handles POST /v1/orders. Requires merchant auth (see
-// authMiddleware); the calling merchant is taken from the request
-// context, never from the request body.
+// CreateOrder handles POST /v1/orders. Guarded by apiKeyMiddleware.
 func (h *Handlers) CreateOrder(w http.ResponseWriter, r *http.Request) {
-	m := merchantFromContext(r.Context())
-	if m == nil {
-		writeError(w, http.StatusUnauthorized, "unauthenticated")
-		return
-	}
-
 	var req createOrderRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	amount, err := decimal.NewFromString(req.AmountUSD)
+	amount, err := decimal.NewFromString(req.BaseAmountUSD)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "amount_usd must be a valid decimal string")
+		writeError(w, http.StatusBadRequest, "base_amount_usd must be a valid decimal string")
 		return
 	}
 
-	order, err := h.orders.CreateOrder(r.Context(), m.ID, amount, req.PreferredChain)
+	order, err := h.orders.CreateOrder(r.Context(), req.UserID, amount, req.Chain)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toOrderResponse(order))
+	writeJSON(w, http.StatusCreated, h.toOrderResponse(order))
 }
 
-// GetOrder handles GET /v1/orders/{order_id}. This is intentionally
-// public (no merchant auth): the paying frontend — the end customer's
-// browser — polls it directly, and an order ID is an unguessable random
+// GetOrder handles GET /v1/orders/{order_id}. Public: the paying
+// frontend polls it directly, and an order ID is an unguessable random
 // UUID, not a sequential or otherwise enumerable identifier.
 func (h *Handlers) GetOrder(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "orderID")
@@ -116,55 +92,27 @@ func (h *Handlers) GetOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toOrderResponse(order))
+	writeJSON(w, http.StatusOK, h.toOrderResponse(order))
 }
 
-// RegisterWebhook handles POST /v1/webhooks/register. Requires merchant
-// auth; issues a fresh signing secret every time it's called, which
-// invalidates any secret issued previously for this merchant.
-func (h *Handlers) RegisterWebhook(w http.ResponseWriter, r *http.Request) {
-	m := merchantFromContext(r.Context())
-	if m == nil {
-		writeError(w, http.StatusUnauthorized, "unauthenticated")
-		return
-	}
-
-	var req registerWebhookRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	parsed, err := url.Parse(req.URL)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		writeError(w, http.StatusBadRequest, "url must be a valid http(s) URL")
-		return
-	}
-
-	secret, err := h.merchant.RegisterWebhook(r.Context(), m.ID, req.URL)
-	if err != nil {
-		h.logger.Error("register webhook failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, registerWebhookResponse{WebhookSecret: secret})
-}
-
-func toOrderResponse(o *orders.Order) orderResponse {
+func (h *Handlers) toOrderResponse(o *orders.Order) orderResponse {
 	resp := orderResponse{
 		OrderID:        o.ID.String(),
+		UserID:         o.UserID,
 		Chain:          o.Chain,
 		Token:          o.Token,
-		DepositAddress: o.DerivedAddress,
-		QRString:       o.DerivedAddress,
-		AmountUSD:      o.AmountUSD.String(),
-		AmountToken:    o.AmountToken.String(),
+		Address:        h.addresses[chains.Chain(o.Chain)],
+		QRString:       h.addresses[chains.Chain(o.Chain)],
+		BaseAmountUSD:  o.BaseAmountUSD.String(),
+		ExpectedAmount: o.ExpectedAmount.String(),
 		Status:         string(o.Status),
 		Confirmations:  o.Confirmations,
 		RequiredConfs:  o.RequiredConfirmations,
 		CreatedAt:      o.CreatedAt.UTC().Format(timeFormat),
 		ExpiresAt:      o.ExpiresAt.UTC().Format(timeFormat),
+	}
+	if o.ReceivedAmount != nil {
+		resp.ReceivedAmount = o.ReceivedAmount.String()
 	}
 	if o.TxHash != nil {
 		resp.TxHash = *o.TxHash

@@ -1,19 +1,18 @@
 // Package evm implements chains.ChainWatcher for EVM-compatible chains
-// (Ethereum, BSC, Polygon, and any future EVM chain) with a single
-// implementation parameterized by config.EVMConfig. It detects USDT
-// deposits via eth_getLogs, filtered server-side to the USDT contract's
-// Transfer topic and the current set of watched recipient addresses —
-// never a full block scan.
+// (Polygon, BSC, and any future EVM chain) with a single implementation
+// parameterized by config.EVMConfig. It detects USDT transfers to one
+// fixed address via eth_getLogs, filtered server-side to the USDT
+// contract's Transfer topic and that address — never a full block scan.
 package evm
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/big"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/hiren223344/frpay/internal/chains"
 	"github.com/hiren223344/frpay/internal/config"
@@ -23,37 +22,36 @@ import (
 // standard ERC20 Transfer event signature shared by every EVM chain.
 const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-const usdtDecimals = 6 // true for USDT on Ethereum, BSC and Polygon
+const usdtDecimals = 6 // true for USDT on Polygon and BSC
 
-type pendingDeposit struct {
-	address     string
+type pendingTransfer struct {
+	amount      decimal.Decimal
 	blockHeight int64
-	amount      *big.Int
 }
 
 type Watcher struct {
-	cfg     config.EVMConfig
-	chain   chains.Chain
-	client  *client
-	sink    chains.DepositSink
-	cursors chains.CursorStore
-	logger  *slog.Logger
+	cfg          config.EVMConfig
+	chain        chains.Chain
+	addressTopic string // cfg.Address padded to a 32-byte topic, precomputed once
+	client       *client
+	sink         chains.TransferSink
+	cursors      chains.CursorStore
+	logger       *slog.Logger
 
-	mu      sync.RWMutex
-	watched map[string]string // lowercase address -> canonical checksummed address
-	pending map[string]pendingDeposit
+	mu      sync.Mutex
+	pending map[string]pendingTransfer
 }
 
-func NewWatcher(chain chains.Chain, cfg config.EVMConfig, sink chains.DepositSink, cursors chains.CursorStore, logger *slog.Logger) *Watcher {
+func NewWatcher(chain chains.Chain, cfg config.EVMConfig, sink chains.TransferSink, cursors chains.CursorStore, logger *slog.Logger) *Watcher {
 	return &Watcher{
-		cfg:     cfg,
-		chain:   chain,
-		client:  newClient(cfg.RPCURL, cfg.FallbackRPCURLs),
-		sink:    sink,
-		cursors: cursors,
-		logger:  logger.With("chain", chain),
-		watched: make(map[string]string),
-		pending: make(map[string]pendingDeposit),
+		cfg:          cfg,
+		chain:        chain,
+		addressTopic: addressToTopic(cfg.Address),
+		client:       newClient(cfg.RPCURL, cfg.FallbackRPCURLs),
+		sink:         sink,
+		cursors:      cursors,
+		logger:       logger.With("chain", chain),
+		pending:      make(map[string]pendingTransfer),
 	}
 }
 
@@ -61,26 +59,11 @@ func (w *Watcher) Chain() chains.Chain { return w.chain }
 
 func (w *Watcher) RequiredConfirmations() int64 { return w.cfg.RequiredConfirms }
 
-func (w *Watcher) WatchAddress(_ context.Context, address string) error {
+func (w *Watcher) SeedPending(_ context.Context, transfer chains.PendingTransfer) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.watched[strings.ToLower(address)] = address
-	return nil
-}
-
-func (w *Watcher) UnwatchAddress(_ context.Context, address string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	delete(w.watched, strings.ToLower(address))
-	return nil
-}
-
-func (w *Watcher) SeedConfirming(_ context.Context, address, txHash string, blockHeight int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.watched[strings.ToLower(address)] = address
-	if _, exists := w.pending[strings.ToLower(txHash)]; !exists {
-		w.pending[strings.ToLower(txHash)] = pendingDeposit{address: address, blockHeight: blockHeight}
+	if _, exists := w.pending[transfer.TxHash]; !exists {
+		w.pending[transfer.TxHash] = pendingTransfer{amount: transfer.Amount, blockHeight: transfer.BlockHeight}
 	}
 	return nil
 }
@@ -128,17 +111,6 @@ func (w *Watcher) blockNumber(ctx context.Context) (int64, error) {
 }
 
 func (w *Watcher) scanNewLogs(ctx context.Context, latestBlock int64) error {
-	w.mu.RLock()
-	if len(w.watched) == 0 {
-		w.mu.RUnlock()
-		return nil
-	}
-	topicAddrs := make([]string, 0, len(w.watched))
-	for lower := range w.watched {
-		topicAddrs = append(topicAddrs, addressToTopic(lower))
-	}
-	w.mu.RUnlock()
-
 	fromBlock, _, err := w.cursors.GetCursor(ctx, w.chain)
 	if err != nil {
 		return fmt.Errorf("load cursor: %w", err)
@@ -174,7 +146,7 @@ func (w *Watcher) scanNewLogs(ctx context.Context, latestBlock int64) error {
 			"fromBlock": toHexQuantity(cursor),
 			"toBlock":   toHexQuantity(to),
 			"address":   w.cfg.USDTContract,
-			"topics":    []interface{}{transferTopic, nil, topicAddrs},
+			"topics":    []interface{}{transferTopic, nil, w.addressTopic},
 		}}
 
 		var logs []rpcLog
@@ -200,49 +172,41 @@ func (w *Watcher) handleLog(l rpcLog) {
 	if len(l.Topics) < 3 {
 		return
 	}
-	toAddrLower := topicToAddress(l.Topics[2])
 
-	w.mu.RLock()
-	canonical, isWatched := w.watched[toAddrLower]
-	w.mu.RUnlock()
-	if !isWatched {
-		return
-	}
-
-	amount, err := parseHexBigInt(l.Data)
+	rawAmount, err := parseHexBigInt(l.Data)
 	if err != nil {
 		w.logger.Warn("skip log with unparseable amount", "tx", l.TransactionHash, "data", l.Data, "error", err)
 		return
 	}
+	amount := decimal.NewFromBigInt(rawAmount, -usdtDecimals)
+
 	blockHeight, err := parseHexQuantity(l.BlockNumber)
 	if err != nil {
 		w.logger.Warn("skip log with unparseable block number", "tx", l.TransactionHash, "error", err)
 		return
 	}
 
-	key := strings.ToLower(l.TransactionHash)
 	w.mu.Lock()
-	w.pending[key] = pendingDeposit{address: canonical, blockHeight: blockHeight, amount: amount}
+	w.pending[l.TransactionHash] = pendingTransfer{amount: amount, blockHeight: blockHeight}
 	w.mu.Unlock()
 }
 
 func (w *Watcher) refreshConfirmations(ctx context.Context, latestBlock int64) {
 	type item struct {
 		txHash      string
-		address     string
+		amount      decimal.Decimal
 		blockHeight int64
-		amount      *big.Int
 	}
 
-	w.mu.RLock()
+	w.mu.Lock()
 	items := make([]item, 0, len(w.pending))
 	for tx, p := range w.pending {
-		items = append(items, item{tx, p.address, p.blockHeight, p.amount})
+		items = append(items, item{tx, p.amount, p.blockHeight})
 	}
-	w.mu.RUnlock()
+	w.mu.Unlock()
 
 	for _, it := range items {
-		w.emit(ctx, it.txHash, it.address, it.amount, it.blockHeight, latestBlock)
+		w.emit(ctx, it.txHash, it.amount, it.blockHeight, latestBlock)
 
 		confirmations := latestBlock - it.blockHeight + 1
 		if confirmations >= w.cfg.RequiredConfirms {
@@ -253,22 +217,20 @@ func (w *Watcher) refreshConfirmations(ctx context.Context, latestBlock int64) {
 	}
 }
 
-func (w *Watcher) emit(ctx context.Context, txHash, address string, amount *big.Int, blockHeight, latestBlock int64) {
+func (w *Watcher) emit(ctx context.Context, txHash string, amount decimal.Decimal, blockHeight, latestBlock int64) {
 	confirmations := latestBlock - blockHeight + 1
 	if confirmations < 0 {
 		confirmations = 0
 	}
-	event := chains.DepositEvent{
+	event := chains.TransferEvent{
 		Chain:         w.chain,
-		ToAddress:     address,
 		TxHash:        txHash,
 		Amount:        amount,
-		TokenDecimals: usdtDecimals,
 		BlockHeight:   blockHeight,
 		Confirmations: confirmations,
 		ObservedAt:    time.Now(),
 	}
-	if err := w.sink.OnDeposit(ctx, event); err != nil {
-		w.logger.Error("sink rejected deposit event", "tx", txHash, "error", err)
+	if err := w.sink.OnTransfer(ctx, event); err != nil {
+		w.logger.Error("sink rejected transfer event", "tx", txHash, "error", err)
 	}
 }

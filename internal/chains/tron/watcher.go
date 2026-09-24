@@ -1,83 +1,73 @@
 // Package tron implements chains.ChainWatcher for TRON, detecting
-// USDT-TRC20 deposits by polling TronGrid's contract-events API for
-// Transfer events emitted by the USDT contract — not by scanning every
-// transaction in every block. This is the reference chain
-// implementation; EVM chains follow the same shape in internal/chains/evm.
+// USDT-TRC20 transfers to a single fixed receiving address by polling
+// TronGrid's contract-events API for Transfer events emitted by the USDT
+// contract — not by scanning every transaction in every block. This is
+// the reference chain implementation; the other chains follow the same
+// shape.
 package tron
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/hiren223344/frpay/internal/chains"
 	"github.com/hiren223344/frpay/internal/config"
-	"github.com/hiren223344/frpay/internal/wallet"
 )
 
 // usdtDecimals is fixed for USDT-TRC20 (the only token this watcher
 // tracks).
 const usdtDecimals = 6
 
-type pendingDeposit struct {
-	address     string
+type pendingTransfer struct {
+	amount      decimal.Decimal
 	blockHeight int64
-	amount      *big.Int
 }
 
 type Watcher struct {
-	cfg     config.TronConfig
-	client  *client
-	sink    chains.DepositSink
-	cursors chains.CursorStore
-	logger  *slog.Logger
+	cfg        config.TronConfig
+	addressHex string // lowercase hex form of cfg.Address, matched against events
+	client     *client
+	sink       chains.TransferSink
+	cursors    chains.CursorStore
+	logger     *slog.Logger
 
-	mu      sync.RWMutex
-	watched map[string]struct{}
-	pending map[string]pendingDeposit // txHash -> deposit info
+	mu      sync.Mutex
+	pending map[string]pendingTransfer // txHash -> transfer info
 }
 
-func NewWatcher(cfg config.TronConfig, sink chains.DepositSink, cursors chains.CursorStore, logger *slog.Logger) *Watcher {
-	return &Watcher{
-		cfg:     cfg,
-		client:  newClient(cfg.APIURL, cfg.FallbackAPIURLs, cfg.APIKey),
-		sink:    sink,
-		cursors: cursors,
-		logger:  logger.With("chain", "tron"),
-		watched: make(map[string]struct{}),
-		pending: make(map[string]pendingDeposit),
+func NewWatcher(cfg config.TronConfig, sink chains.TransferSink, cursors chains.CursorStore, logger *slog.Logger) (*Watcher, error) {
+	addressHex, err := addressToHex(cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("tron watcher: %w", err)
 	}
+	return &Watcher{
+		cfg:        cfg,
+		addressHex: addressHex,
+		client:     newClient(cfg.APIURL, cfg.FallbackAPIURLs, cfg.APIKey),
+		sink:       sink,
+		cursors:    cursors,
+		logger:     logger.With("chain", "tron"),
+		pending:    make(map[string]pendingTransfer),
+	}, nil
 }
 
 func (w *Watcher) Chain() chains.Chain { return chains.Tron }
 
 func (w *Watcher) RequiredConfirmations() int64 { return w.cfg.RequiredConfirms }
 
-func (w *Watcher) WatchAddress(_ context.Context, address string) error {
+func (w *Watcher) SeedPending(_ context.Context, transfer chains.PendingTransfer) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.watched[address] = struct{}{}
-	return nil
-}
-
-func (w *Watcher) UnwatchAddress(_ context.Context, address string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	delete(w.watched, address)
-	return nil
-}
-
-func (w *Watcher) SeedConfirming(_ context.Context, address, txHash string, blockHeight int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.watched[address] = struct{}{}
-	if _, exists := w.pending[txHash]; !exists {
-		w.pending[txHash] = pendingDeposit{address: address, blockHeight: blockHeight}
+	if _, exists := w.pending[transfer.TxHash]; !exists {
+		w.pending[transfer.TxHash] = pendingTransfer{amount: transfer.Amount, blockHeight: transfer.BlockHeight}
 	}
 	return nil
 }
@@ -136,8 +126,8 @@ func (w *Watcher) scanNewEvents(ctx context.Context, latestBlock int64) error {
 	minTimestamp := lastScannedAt.UnixMilli() + 1
 	if lastScannedAt.IsZero() {
 		// First run: don't scan the USDT contract's entire event history,
-		// just start a short lookback so nothing sent right before startup
-		// is missed.
+		// just start a short lookback so nothing sent right before
+		// startup is missed.
 		minTimestamp = time.Now().Add(-10 * time.Minute).UnixMilli()
 	}
 
@@ -187,51 +177,38 @@ func (w *Watcher) scanNewEvents(ctx context.Context, latestBlock int64) error {
 }
 
 func (w *Watcher) handleEvent(ev contractEvent) {
-	toHex := ev.Result["to"]
-	if toHex == "" {
+	if !strings.EqualFold(ev.Result["to"], w.addressHex) {
 		return
 	}
-	addr, err := wallet.TronAddressFromHex(toHex)
+
+	rawValue, err := decimal.NewFromString(ev.Result["value"])
 	if err != nil {
-		w.logger.Debug("skip event with unparseable address", "to", toHex, "error", err)
-		return
-	}
-
-	w.mu.RLock()
-	_, isWatched := w.watched[addr]
-	w.mu.RUnlock()
-	if !isWatched {
-		return
-	}
-
-	amount, ok := new(big.Int).SetString(ev.Result["value"], 10)
-	if !ok {
 		w.logger.Warn("skip event with unparseable amount", "tx", ev.TransactionID, "value", ev.Result["value"])
 		return
 	}
+	amount := rawValue.Shift(-usdtDecimals)
 
 	w.mu.Lock()
-	w.pending[ev.TransactionID] = pendingDeposit{address: addr, blockHeight: ev.BlockNumber, amount: amount}
+	w.pending[ev.TransactionID] = pendingTransfer{amount: amount, blockHeight: ev.BlockNumber}
 	w.mu.Unlock()
 }
 
 func (w *Watcher) refreshConfirmations(ctx context.Context, latestBlock int64) {
 	type item struct {
 		txHash      string
-		address     string
+		amount      decimal.Decimal
 		blockHeight int64
-		amount      *big.Int
 	}
 
-	w.mu.RLock()
+	w.mu.Lock()
 	items := make([]item, 0, len(w.pending))
 	for tx, p := range w.pending {
-		items = append(items, item{tx, p.address, p.blockHeight, p.amount})
+		items = append(items, item{tx, p.amount, p.blockHeight})
 	}
-	w.mu.RUnlock()
+	w.mu.Unlock()
 
 	for _, it := range items {
-		w.emit(ctx, it.txHash, it.address, it.amount, it.blockHeight, latestBlock)
+		w.emit(ctx, it.txHash, it.amount, it.blockHeight, latestBlock)
 
 		confirmations := latestBlock - it.blockHeight + 1
 		if confirmations >= w.cfg.RequiredConfirms {
@@ -242,22 +219,20 @@ func (w *Watcher) refreshConfirmations(ctx context.Context, latestBlock int64) {
 	}
 }
 
-func (w *Watcher) emit(ctx context.Context, txHash, address string, amount *big.Int, blockHeight, latestBlock int64) {
+func (w *Watcher) emit(ctx context.Context, txHash string, amount decimal.Decimal, blockHeight, latestBlock int64) {
 	confirmations := latestBlock - blockHeight + 1
 	if confirmations < 0 {
 		confirmations = 0
 	}
-	event := chains.DepositEvent{
+	event := chains.TransferEvent{
 		Chain:         chains.Tron,
-		ToAddress:     address,
 		TxHash:        txHash,
 		Amount:        amount,
-		TokenDecimals: usdtDecimals,
 		BlockHeight:   blockHeight,
 		Confirmations: confirmations,
 		ObservedAt:    time.Now(),
 	}
-	if err := w.sink.OnDeposit(ctx, event); err != nil {
-		w.logger.Error("sink rejected deposit event", "tx", txHash, "error", err)
+	if err := w.sink.OnTransfer(ctx, event); err != nil {
+		w.logger.Error("sink rejected transfer event", "tx", txHash, "error", err)
 	}
 }

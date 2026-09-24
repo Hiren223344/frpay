@@ -1,221 +1,96 @@
 # Frenix Pay
 
 A standalone, self-hosted crypto payment gateway for accepting USDT
-deposits across TRON, Ethereum, BSC and Polygon, with fully automated
+deposits across TRON, TON, Polygon and BSC, with fully automated
 on-chain detection and confirmation. It is not part of frenix-back-v3 or
-any existing gateway — it's a separate service that other Frenix products
-call over HTTP. No third-party payment processor, no Cloudflare
-dependency; it runs as its own process on your VPS.
+any existing gateway — it's a separate service that other Frenix
+products call over HTTP. No third-party payment processor, no
+Cloudflare dependency; it runs as its own process on your VPS.
+
+**Full documentation:**
+- [docs.md](docs.md) — API reference, matching algorithm, chain watcher
+  model, configuration reference, manual-review queue, how to add a
+  chain, testing
+- [deploy.md](deploy.md) — VPS deployment: systemd, Postgres/Redis, TLS,
+  firewall, backups
+
+## Receiving address model
+
+Every chain has **one fixed receiving address**, set once in config —
+not a unique address generated per order. This service holds no key
+material at all, not even a watch-only extended public key: it only
+ever needs the plain address to watch.
+
+Since every customer on a given chain pays the same address, orders are
+distinguished by **amount**: `expected_amount` is `base_amount_usd` plus
+a small random offset (e.g. `$10.0042`), unique among that chain's
+currently-pending orders. See
+[docs.md#how-matching-works](docs.md#how-matching-works) for the full
+algorithm, including how underpayments and transfers that don't match
+anything are handled — both are logged for manual review, never
+silently dropped.
 
 ## How it's put together
 
 ```
 cmd/frenixpay          entrypoint: wires everything, runs the HTTP server,
-                        chain watchers, expiry job and webhook dispatcher
+                        chain watchers and the order-expiry job
 internal/
-  api/                  chi router, handlers, HMAC auth + rate limiting
-  audit/                append-only log of every detected/confirmed tx
+  api/                  chi router, handlers, API-key auth + rate limiting
+  audit/                append-only log of every detected transfer
   chains/                the ChainWatcher interface + Manager
     tron/                reference implementation: TronGrid polling
-    evm/                 shared implementation for Ethereum/BSC/Polygon
+    ton/                 toncenter.com v3 jetton-transfers polling
+    evm/                 shared implementation for Polygon + BSC
   config/                env-driven configuration
   db/                    Postgres + Redis wiring, migrations, cursor store
-  merchant/              API key/HMAC auth, webhook secret issuance
-  orders/                order lifecycle: create, confirm, expire
+  orders/                order lifecycle: create, match, confirm, expire
   ratelimit/             Redis-backed fixed-window limiter
-  security/              AES-GCM encryption for merchant secrets at rest
-  wallet/                watch-only BIP44 address derivation
-  webhook/               HMAC-signed outbound delivery with retry
 migrations/              golang-migrate SQL schema
-cmd/democheckout        reference merchant backend for the checkout demo below
-web/checkout             static checkout page for cmd/democheckout to serve
 ```
 
-## Design choices
-
-**Postgres**, via sqlx. Orders are a financial ledger: exact `NUMERIC`
-amounts, `SELECT`-free atomic updates via `UPDATE ... WHERE ... RETURNING`
-for idempotent confirmation handling, partial/unique indexes (one
-unwatched address per order, one order per `(chain, tx_hash)` ever), and
-JSONB for the audit trail. golang-migrate and sqlx both have first-class
-Postgres support.
-
-**Redis** is a performance layer only — the public API rate limiter and,
-if you extend it, a hot cache in front of Postgres. Postgres is always
-the durable source of truth for chain cursors and order state, so a
-flushed Redis instance can never cause a missed or double-processed
-deposit.
-
-**Chain watchers are targeted, not full block scans.** TRON polls
-TronGrid's contract-events API filtered to the USDT contract's `Transfer`
-event; EVM chains use `eth_getLogs` filtered to the USDT contract and the
-current set of watched recipient addresses (passed as an OR-matched
-topic filter). Neither ever iterates every transaction in every block.
-
-**Watch-only wallet.** This service is handed extended *public* keys
-only — one for TRON (`m/44'/195'/0'/0`), one shared by every EVM chain
-(`m/44'/60'/0'/0`, since the same secp256k1 pubkey→address transform
-applies to all of them). It derives a brand-new, never-reused address per
-order and can reconstruct every deposit address it has ever issued — and
-can never move a single unit of the funds sent to them, because it never
-holds a private key. `internal/wallet.New` rejects an `xprv` outright if
-one is ever configured by mistake.
-
-## Order lifecycle
-
-1. `POST /v1/orders` (merchant-authenticated) allocates the next unused
-   BIP44 index — atomically, from a Postgres sequence table, per wallet
-   family (`tron` / `evm`, the latter shared across EVM chains so an
-   address is never reused across chains either) — derives the deposit
-   address, and starts watching it.
-2. Every chain watcher reports deposits through the same
-   `chains.DepositSink` interface. `internal/orders.Repository.ApplyDeposit`
-   is a single atomic `UPDATE` that claims the order on first sighting,
-   only ever writes a non-decreasing confirmation count, and only matches
-   while the order is still `pending`/`confirming` — so it's safe to call
-   repeatedly, including with duplicate or out-of-order watcher events
-   for the same `tx_hash`.
-3. Crossing `required_confirmations` transitions the order to `confirmed`
-   in that same statement, unwatches the address, and enqueues a
-   signed webhook delivery.
-4. A background job expires unpaid `pending` orders past their
-   `expires_at` and stops watching their addresses.
-5. On restart, `orders.Service.LoadActiveWatches` reloads every
-   `pending`/`confirming` order's address into the relevant watcher (and
-   re-seeds in-flight confirmation tracking for anything already
-   `confirming`), so nothing is missed across a restart.
-
-## Adding a new chain
-
-Implement `chains.ChainWatcher` (see `internal/chains/watcher.go`) in a
-new subpackage and register it in `cmd/frenixpay/main.go`. Nothing in
-`internal/orders` or `internal/api` needs to change.
-
-## Running locally
+## Quickstart
 
 ```bash
-cp .env.example .env    # fill in APP_ENCRYPTION_KEY, MASTER_XPUB_TRON, etc.
-make dev-up              # Postgres + Redis via docker compose
+cp .env.example .env    # fill in API_KEY and each chain's fixed address
 set -a && source .env && set +a
-make build
-./bin/frenixpay -create-merchant="Frenix Back V3"   # prints API key + secret once
-make run
+
+go build -o bin/frenixpay ./cmd/frenixpay
+./bin/frenixpay
 ```
 
-The binary applies pending migrations itself on every startup — `make
-migrate-up`/`migrate-down` are only there for manual inspection or
-rollback via the golang-migrate CLI.
-
-## API
-
-All request/response bodies are JSON. Merchant-authenticated endpoints
-require three headers:
-
-- `X-Frenix-Key`: the merchant's API key
-- `X-Frenix-Timestamp`: unix seconds
-- `X-Frenix-Signature`: `hex(HMAC-SHA256(api_secret, "{timestamp}.{method}.{path}.{body}"))`
-
-A request is rejected if its timestamp is more than 5 minutes off, so a
-captured signature can't be replayed indefinitely.
-
-### `POST /v1/orders` (merchant-authenticated)
-
-```json
-{ "amount_usd": "25.00", "chain": "tron" }
-```
-
-`chain` is optional; omit it to let the service pick (TRON first, then
-whichever EVM chain is enabled). Returns:
-
-```json
-{
-  "order_id": "...", "chain": "tron", "token": "USDT",
-  "deposit_address": "T...", "qr_string": "T...",
-  "amount_usd": "25.00", "amount_token": "25.00",
-  "status": "pending", "confirmations": 0, "required_confirmations": 20,
-  "created_at": "...", "expires_at": "..."
-}
-```
-
-### `GET /v1/orders/{order_id}` (public)
-
-Intentionally unauthenticated — the paying customer's own browser polls
-this directly, and an order ID is an unguessable random UUID, not a
-sequential one. Same shape as the create response, updated live.
-
-### `POST /v1/webhooks/register` (merchant-authenticated)
-
-```json
-{ "url": "https://your-service.example/frenixpay/webhook" }
-```
-
-Returns `{ "webhook_secret": "..." }` — shown once. Frenix Pay signs every
-delivery to that URL the same way: `X-Frenix-Signature` /
-`X-Frenix-Timestamp` headers, `hex(HMAC-SHA256(webhook_secret,
-"{timestamp}.{body}"))`. Delivery is retried with exponential backoff
-(persisted in Postgres, so it survives a restart) up to 8 attempts;
-polling `GET /v1/orders/{order_id}` remains available as a fallback for
-merchants who don't register a webhook, or whose endpoint is down past
-the retry budget.
-
-### `GET /v1/chains` (public)
-
-Lists the chains currently enabled, for populating a network picker
-without hardcoding it client-side:
-
-```json
-[{ "chain": "tron", "label": "TRON (TRC20)", "token": "USDT", "decimals": 6, "required_confirmations": 20 }]
-```
-
-## Checkout demo (`cmd/democheckout` + `web/checkout`)
-
-A working reference checkout page, wired to the real API above — not a
-mockup. It demonstrates the integration pattern every Frenix product
-should follow:
-
-- **`POST /v1/orders` is merchant-authenticated and must never be called
-  from a browser** — the HMAC secret can't be exposed client-side.
-  `cmd/democheckout` stands in for a real merchant backend (e.g.
-  frenix-back-v3): it holds the API key/secret server-side, signs and
-  creates the order when the customer picks a network, and hands the
-  browser back just the `order_id`.
-- From there, `web/checkout`'s JS only ever talks to two things: the
-  demo backend's own `/checkout/create-order` (same-origin), and Frenix
-  Pay's public `GET /v1/orders/{id}` / `GET /v1/chains` directly
-  (cross-origin — these two routes send `Access-Control-Allow-Origin: *`
-  specifically because they're meant to be polled by a checkout page
-  hosted on the merchant's own domain, not this service's).
-- Everything shown is live: the network list, the derived deposit
-  address and QR code (rendered client-side with a vendored copy of
-  [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator),
-  MIT-licensed, no CDN dependency), the countdown to the order's real
-  `expires_at`, and confirmation progress — all driven by polling the
-  order every few seconds and rendering whatever status comes back
-  (`pending` → `confirming` → `confirmed`, or `expired`).
-
-Run it alongside `frenixpay`:
+The binary applies pending migrations itself on every startup. See
+[deploy.md](deploy.md) for Postgres/Redis setup and running this for
+real on a VPS.
 
 ```bash
-make build
-./bin/frenixpay -create-merchant="Acme Studio"   # note the API key + secret
+curl http://localhost:8080/v1/chains
 
-FRENIXPAY_API_KEY=fp_live_...
-FRENIXPAY_API_SECRET=...
-FRENIXPAY_BASE_URL=http://localhost:8080
-LISTEN_ADDR=:8090
-go build -o bin/democheckout ./cmd/democheckout && ./bin/democheckout
+curl -X POST http://localhost:8080/v1/orders \
+  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"user_id":"user_123","base_amount_usd":"10.00","chain":"tron"}'
 ```
 
-Then open `http://localhost:8090/?amount=249.00`. `amount`, `merchant`
-and `item` are query params for demo purposes; a real integration would
-set those server-side when the merchant backend renders/redirects to the
-page instead.
+## Testing
+
+```bash
+go build ./... && go vet ./...
+
+# Amount-matching integration tests need a real Postgres with migrations
+# applied (see docs.md#testing) — they skip cleanly without one:
+TEST_POSTGRES_DSN="postgres://user:pass@localhost:5432/frenixpay?sslmode=disable" \
+  go test ./internal/orders/... -v
+```
 
 ## Security notes
 
-- The master seed/private keys never touch this service — only a
-  watch-only xpub per wallet family, loaded from env.
-- Merchant `api_secret` and `webhook_secret` are encrypted at rest
-  (AES-256-GCM, keyed by `APP_ENCRYPTION_KEY`), not stored in plaintext.
-- Nothing under `internal/wallet`, `internal/security` or `internal/config`
-  logs a secret value — only derived addresses and non-secret metadata.
+- No chain in this service is ever given a private key — only the
+  public address to watch. `internal/chains/*` reads on-chain data only.
+- `API_KEY` is the single credential guarding `POST /v1/orders`; it must
+  never be exposed to a browser. `GET /v1/orders/{id}` and `GET
+  /v1/chains` are intentionally public (see docs.md) for a customer-
+  facing frontend to poll directly.
+- The TON watcher's API shape and confirmation model were written
+  without live access to verify against toncenter.com — see the caveat
+  in [docs.md](docs.md#chain-watchers) before relying on it in
+  production.

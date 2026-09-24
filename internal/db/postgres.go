@@ -1,6 +1,5 @@
 // Package db wires the Postgres connection pool (source of truth for
-// orders, merchants, and chain cursors) and applies schema migrations on
-// startup.
+// orders and chain cursors) and applies schema migrations on startup.
 package db
 
 import (

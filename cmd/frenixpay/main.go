@@ -1,12 +1,10 @@
 // Command frenixpay runs the Frenix Pay service: the public HTTP API,
-// every enabled chain watcher, the order-expiry job and the webhook
-// delivery loop, all in one process.
+// every enabled chain watcher, and the order-expiry job, all in one
+// process.
 package main
 
 import (
 	"context"
-	"flag"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,35 +17,29 @@ import (
 	"github.com/hiren223344/frpay/internal/audit"
 	"github.com/hiren223344/frpay/internal/chains"
 	"github.com/hiren223344/frpay/internal/chains/evm"
+	"github.com/hiren223344/frpay/internal/chains/ton"
 	"github.com/hiren223344/frpay/internal/chains/tron"
 	"github.com/hiren223344/frpay/internal/config"
 	"github.com/hiren223344/frpay/internal/db"
-	"github.com/hiren223344/frpay/internal/merchant"
 	"github.com/hiren223344/frpay/internal/orders"
 	"github.com/hiren223344/frpay/internal/ratelimit"
-	"github.com/hiren223344/frpay/internal/security"
-	"github.com/hiren223344/frpay/internal/wallet"
-	"github.com/hiren223344/frpay/internal/webhook"
 )
 
-// depositSinkProxy breaks the construction-order cycle between
+// transferSinkProxy breaks the construction-order cycle between
 // chains.Manager (which the watchers need to exist before) and
 // orders.Service (which needs the Manager to exist before it, but is
-// itself the DepositSink every watcher reports into). No watcher polls
+// itself the TransferSink every watcher reports into). No watcher polls
 // until Manager.Run is started explicitly, well after svc is set, so
 // this is safe without further synchronization.
-type depositSinkProxy struct {
+type transferSinkProxy struct {
 	svc *orders.Service
 }
 
-func (p *depositSinkProxy) OnDeposit(ctx context.Context, event chains.DepositEvent) error {
-	return p.svc.OnDeposit(ctx, event)
+func (p *transferSinkProxy) OnTransfer(ctx context.Context, event chains.TransferEvent) error {
+	return p.svc.OnTransfer(ctx, event)
 }
 
 func main() {
-	createMerchant := flag.String("create-merchant", "", "provision a new merchant with this name, print its credentials, and exit")
-	flag.Parse()
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -72,28 +64,6 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	box, err := security.NewBox(cfg.AppEncryptionKey)
-	if err != nil {
-		logger.Error("encryption box init failed", "error", err)
-		os.Exit(1)
-	}
-
-	merchantRepo := merchant.NewRepository(sqlDB)
-	merchantSvc := merchant.NewService(merchantRepo, box)
-
-	if *createMerchant != "" {
-		apiKey, apiSecret, err := merchantSvc.CreateMerchant(ctx, *createMerchant)
-		if err != nil {
-			logger.Error("create merchant failed", "error", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Merchant %q created.\n", *createMerchant)
-		fmt.Printf("API Key:    %s\n", apiKey)
-		fmt.Printf("API Secret: %s\n", apiSecret)
-		fmt.Println("Store the secret now — it is never shown again and is only kept encrypted from here on.")
-		return
-	}
-
 	redisClient, err := db.ConnectRedis(ctx, cfg.RedisAddr, cfg.RedisDB)
 	if err != nil {
 		logger.Error("redis connection failed", "error", err)
@@ -101,30 +71,31 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	hdWallet, err := wallet.New(map[wallet.ChainFamily]string{
-		wallet.FamilyTron: cfg.MasterXPubTron,
-		wallet.FamilyEVM:  cfg.MasterXPubEVM,
-	})
-	if err != nil {
-		logger.Error("wallet init failed", "error", err)
-		os.Exit(1)
-	}
-
 	cursorStore := db.NewCursorStore(sqlDB)
-	sinkProxy := &depositSinkProxy{}
+	sinkProxy := &transferSinkProxy{}
+	addresses := make(map[chains.Chain]string)
 
 	var watchers []chains.ChainWatcher
 	if cfg.Chains.Tron.Enabled {
-		watchers = append(watchers, tron.NewWatcher(cfg.Chains.Tron, sinkProxy, cursorStore, logger))
+		w, err := tron.NewWatcher(cfg.Chains.Tron, sinkProxy, cursorStore, logger)
+		if err != nil {
+			logger.Error("tron watcher init failed", "error", err)
+			os.Exit(1)
+		}
+		watchers = append(watchers, w)
+		addresses[chains.Tron] = cfg.Chains.Tron.Address
 	}
-	if cfg.Chains.Ethereum.Enabled {
-		watchers = append(watchers, evm.NewWatcher(chains.Ethereum, cfg.Chains.Ethereum, sinkProxy, cursorStore, logger))
-	}
-	if cfg.Chains.BSC.Enabled {
-		watchers = append(watchers, evm.NewWatcher(chains.BSC, cfg.Chains.BSC, sinkProxy, cursorStore, logger))
+	if cfg.Chains.TON.Enabled {
+		watchers = append(watchers, ton.NewWatcher(cfg.Chains.TON, sinkProxy, cursorStore, logger))
+		addresses[chains.TON] = cfg.Chains.TON.Address
 	}
 	if cfg.Chains.Polygon.Enabled {
 		watchers = append(watchers, evm.NewWatcher(chains.Polygon, cfg.Chains.Polygon, sinkProxy, cursorStore, logger))
+		addresses[chains.Polygon] = cfg.Chains.Polygon.Address
+	}
+	if cfg.Chains.BSC.Enabled {
+		watchers = append(watchers, evm.NewWatcher(chains.BSC, cfg.Chains.BSC, sinkProxy, cursorStore, logger))
+		addresses[chains.BSC] = cfg.Chains.BSC.Address
 	}
 	if len(watchers) == 0 {
 		logger.Warn("no chains are enabled; orders can still be created but will never confirm")
@@ -132,21 +103,23 @@ func main() {
 	chainMgr := chains.NewManager(logger, watchers...)
 
 	auditLogger := audit.NewLogger(sqlDB)
-	webhookRepo := webhook.NewRepository(sqlDB)
-	webhookDispatcher := webhook.NewDispatcher(webhookRepo, merchantRepo, merchantSvc, logger)
-
 	ordersRepo := orders.NewRepository(sqlDB)
-	ordersSvc := orders.NewService(ordersRepo, hdWallet, chainMgr, auditLogger, webhookDispatcher, cfg.OrderExpiry, logger)
+	ordersSvc := orders.NewService(
+		ordersRepo, chainMgr, auditLogger, cfg.OrderExpiry,
+		cfg.AmountTolerance, cfg.UnderpaymentMaxGapPercent,
+		cfg.OffsetMinTenThousandths, cfg.OffsetMaxTenThousandths, cfg.MaxCollisionRetries,
+		logger,
+	)
 	sinkProxy.svc = ordersSvc
 
-	if err := ordersSvc.LoadActiveWatches(ctx); err != nil {
-		logger.Error("failed to reload active watches on startup", "error", err)
+	if err := ordersSvc.LoadPendingTransfers(ctx); err != nil {
+		logger.Error("failed to reseed pending transfers on startup", "error", err)
 		os.Exit(1)
 	}
 
-	merchantLimiter := ratelimit.NewLimiter(redisClient, cfg.MerchantRateLimitPerMinute, time.Minute, logger)
+	ordersLimiter := ratelimit.NewLimiter(redisClient, cfg.OrdersRateLimitPerMinute, time.Minute, logger)
 	publicLimiter := ratelimit.NewLimiter(redisClient, cfg.PublicRateLimitPerMinute, time.Minute, logger)
-	router := api.NewRouter(ordersSvc, merchantSvc, chainMgr, merchantLimiter, publicLimiter, logger)
+	router := api.NewRouter(ordersSvc, chainMgr, addresses, cfg.APIKey, ordersLimiter, publicLimiter, logger)
 
 	httpServer := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -170,12 +143,6 @@ func main() {
 	go func() {
 		defer wg.Done()
 		ordersSvc.RunExpiryLoop(ctx, 30*time.Second)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		webhookDispatcher.RunDeliveryLoop(ctx, 15*time.Second)
 	}()
 
 	wg.Add(1)

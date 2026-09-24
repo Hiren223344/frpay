@@ -1,4 +1,4 @@
-.PHONY: build run test vet fmt tidy dev-up dev-down migrate-up migrate-down create-merchant
+.PHONY: build run test test-integration vet fmt tidy dev-up dev-down migrate-up migrate-down
 
 build:
 	go build -o bin/frenixpay ./cmd/frenixpay
@@ -8,6 +8,11 @@ run: build
 
 test:
 	go test ./...
+
+# Amount-matching integration tests against a real Postgres — see docs.md#testing.
+test-integration:
+	TEST_POSTGRES_DSN="$${TEST_POSTGRES_DSN:-postgres://frenixpay:frenixpay@localhost:5432/frenixpay?sslmode=disable}" \
+		go test ./internal/orders/... -v
 
 vet:
 	go vet ./...
@@ -32,6 +37,3 @@ migrate-up:
 
 migrate-down:
 	migrate -path migrations -database "$$POSTGRES_DSN" down 1
-
-create-merchant: build
-	./bin/frenixpay -create-merchant="$(NAME)"

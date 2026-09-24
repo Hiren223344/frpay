@@ -7,9 +7,10 @@ import (
 	"sync"
 )
 
-// Manager runs one goroutine per configured ChainWatcher and restarts a
-// watcher's loop with backoff if it returns an error, rather than taking
-// down the whole service when one chain's RPC is having a bad day.
+// Manager runs one goroutine per configured ChainWatcher. If one
+// watcher's Run returns an error, its remaining siblings keep running
+// until ctx itself is cancelled — one chain's RPC having a bad day
+// shouldn't take down deposit detection for the others.
 type Manager struct {
 	watchers map[Chain]ChainWatcher
 	logger   *slog.Logger
@@ -23,47 +24,25 @@ func NewManager(logger *slog.Logger, watchers ...ChainWatcher) *Manager {
 	return m
 }
 
-func (m *Manager) WatcherFor(chain Chain) (ChainWatcher, bool) {
-	w, ok := m.watchers[chain]
-	return w, ok
-}
-
-// Watch, Unwatch and SeedConfirming delegate to the watcher registered
-// for the given chain. They're the only entry points internal/orders
-// needs into this package, so adding a new chain never requires a
-// change here or in the orders/API layers — just a new ChainWatcher
-// registered with NewManager.
-
-func (m *Manager) Watch(ctx context.Context, chain Chain, address string) error {
-	w, ok := m.watchers[chain]
-	if !ok {
-		return fmt.Errorf("no watcher registered for chain %q", chain)
-	}
-	return w.WatchAddress(ctx, address)
-}
-
-func (m *Manager) Unwatch(ctx context.Context, chain Chain, address string) error {
-	w, ok := m.watchers[chain]
-	if !ok {
-		return fmt.Errorf("no watcher registered for chain %q", chain)
-	}
-	return w.UnwatchAddress(ctx, address)
-}
-
-func (m *Manager) SeedConfirming(ctx context.Context, chain Chain, address, txHash string, blockHeight int64) error {
-	w, ok := m.watchers[chain]
-	if !ok {
-		return fmt.Errorf("no watcher registered for chain %q", chain)
-	}
-	return w.SeedConfirming(ctx, address, txHash, blockHeight)
-}
-
 func (m *Manager) RequiredConfirmations(chain Chain) (int64, bool) {
 	w, ok := m.watchers[chain]
 	if !ok {
 		return 0, false
 	}
 	return w.RequiredConfirmations(), true
+}
+
+// SeedPending delegates to the watcher registered for the given chain.
+// It's the only entry point internal/orders needs into this package
+// beyond Chains()/RequiredConfirmations(), so adding a new chain never
+// requires a change here or in the orders/API layers — just a new
+// ChainWatcher registered with NewManager.
+func (m *Manager) SeedPending(ctx context.Context, chain Chain, transfer PendingTransfer) error {
+	w, ok := m.watchers[chain]
+	if !ok {
+		return fmt.Errorf("no watcher registered for chain %q", chain)
+	}
+	return w.SeedPending(ctx, transfer)
 }
 
 func (m *Manager) Chains() []Chain {
@@ -75,9 +54,6 @@ func (m *Manager) Chains() []Chain {
 }
 
 // Run blocks until ctx is cancelled, running every watcher concurrently.
-// If one watcher's Run returns an error, its remaining siblings keep
-// running until ctx itself is cancelled — one chain having a bad day
-// shouldn't take down deposit detection for the others.
 func (m *Manager) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex

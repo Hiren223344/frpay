@@ -1,53 +1,25 @@
--- Frenix Pay initial schema.
--- This service is watch-only: it never stores private keys, only derived
--- watch addresses and derivation indices computed from a master xpub.
+-- Frenix Pay schema: fixed receiving address per chain, orders matched
+-- by amount (not by a per-order address). This service never derives
+-- addresses or holds any key material — it only reads public on-chain
+-- data against addresses configured once in env.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE merchants (
-    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name                    TEXT NOT NULL,
-    api_key                 TEXT NOT NULL UNIQUE,
-    api_secret_encrypted    BYTEA NOT NULL,
-    webhook_url             TEXT,
-    webhook_secret_encrypted BYTEA,
-    is_active               BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Tracks the next unused BIP44 derivation index per wallet family, so
--- every order gets a brand-new address and none is ever reused. The key
--- is a wallet family ("tron", "evm"), not always a literal chain: every
--- EVM chain (ethereum/bsc/polygon) shares one xpub and therefore one
--- sequence, so an index (and the address it derives) is never handed out
--- twice across any EVM chain, not just within one.
-CREATE TABLE chain_address_sequences (
-    sequence_key TEXT PRIMARY KEY,
-    next_index   BIGINT NOT NULL DEFAULT 0
-);
-
--- Tracks the last block/ledger height each chain watcher has fully
--- processed, so a restart resumes exactly where it left off.
-CREATE TABLE chain_cursors (
-    chain               TEXT PRIMARY KEY,
-    last_scanned_height BIGINT NOT NULL DEFAULT 0,
-    last_scanned_at     TIMESTAMPTZ,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
 CREATE TABLE orders (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    merchant_id             UUID NOT NULL REFERENCES merchants(id),
+    user_id                 TEXT NOT NULL,
     chain                   TEXT NOT NULL,
     token                   TEXT NOT NULL DEFAULT 'USDT',
-    derived_address         TEXT NOT NULL,
-    derivation_index        BIGINT NOT NULL,
-    amount_usd              NUMERIC(20,8) NOT NULL CHECK (amount_usd > 0),
-    amount_token            NUMERIC(38,18) NOT NULL CHECK (amount_token > 0),
-    rate_usd_per_token      NUMERIC(20,8) NOT NULL DEFAULT 1,
+    base_amount_usd         NUMERIC(20,8) NOT NULL CHECK (base_amount_usd > 0),
+    -- base_amount_usd plus a small random offset, unique among this
+    -- chain's currently-pending orders, so concurrent orders on one
+    -- fixed address are distinguishable by amount alone.
+    expected_amount         NUMERIC(20,8) NOT NULL CHECK (expected_amount > 0),
+    -- The amount actually observed on-chain, once a transfer claims or
+    -- underpays this order. NULL until then.
+    received_amount         NUMERIC(20,8),
     status                  TEXT NOT NULL DEFAULT 'pending'
-                                CHECK (status IN ('pending','confirming','confirmed','expired','failed')),
+                                CHECK (status IN ('pending','confirming','confirmed','underpaid','expired')),
     tx_hash                 TEXT,
     tx_block_height         BIGINT,
     confirmations           INTEGER NOT NULL DEFAULT 0,
@@ -58,15 +30,33 @@ CREATE TABLE orders (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_orders_merchant ON orders(merchant_id);
-CREATE INDEX idx_orders_watch ON orders(chain, status) WHERE status IN ('pending','confirming');
-CREATE UNIQUE INDEX idx_orders_chain_address_index ON orders(chain, derivation_index);
+CREATE INDEX idx_orders_user ON orders(user_id);
 
--- A tx_hash may only ever be attributed to one order per chain. This is
--- the backstop that makes confirmation handling idempotent even if a
--- watcher event fires more than once for the same transaction.
-CREATE UNIQUE INDEX idx_orders_chain_txhash ON orders(chain, tx_hash) WHERE tx_hash IS NOT NULL;
+-- Enforces "no two pending orders on the same chain share an expected
+-- amount" at the database level, and doubles as the index the
+-- amount-matching query filters on (chain, status='pending'). Once an
+-- order leaves 'pending' its expected_amount is free to be reused by a
+-- future order.
+CREATE UNIQUE INDEX idx_orders_chain_pending_amount
+    ON orders(chain, expected_amount) WHERE status = 'pending';
 
+-- A tx_hash may only ever be attributed to one order per chain, however
+-- many times a watcher re-reports it while it accumulates confirmations.
+CREATE UNIQUE INDEX idx_orders_chain_txhash
+    ON orders(chain, tx_hash) WHERE tx_hash IS NOT NULL;
+
+-- Tracks the last block/ledger position each chain watcher has fully
+-- processed, so a restart resumes exactly where it left off instead of
+-- re-scanning from genesis or missing the gap since shutdown.
+CREATE TABLE chain_cursors (
+    chain               TEXT PRIMARY KEY,
+    last_scanned_height BIGINT NOT NULL DEFAULT 0,
+    last_scanned_at     TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Full trail of every transfer any watcher ever detected, matched or
+-- not — the audit record this is money, independent of order state.
 CREATE TABLE audit_log (
     id          BIGSERIAL PRIMARY KEY,
     order_id    UUID REFERENCES orders(id),
@@ -80,22 +70,22 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_log_order ON audit_log(order_id);
 CREATE INDEX idx_audit_log_tx ON audit_log(chain, tx_hash);
 
-CREATE TABLE webhook_deliveries (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    order_id        UUID NOT NULL REFERENCES orders(id),
-    merchant_id     UUID NOT NULL REFERENCES merchants(id),
-    url             TEXT NOT NULL,
-    payload         JSONB NOT NULL,
-    signature       TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending','delivered','failed')),
-    attempt_count   INTEGER NOT NULL DEFAULT 0,
-    last_attempt_at TIMESTAMPTZ,
-    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    response_status INTEGER,
-    response_body   TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+-- The manual-review queue: a transfer that didn't match any pending
+-- order's amount within tolerance ('unmatched'), or matched one but for
+-- less than expected ('underpaid'). Real money was received in both
+-- cases, so nothing here is ever silently dropped.
+CREATE TABLE review_items (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chain             TEXT NOT NULL,
+    tx_hash           TEXT NOT NULL,
+    amount            NUMERIC(20,8) NOT NULL,
+    reason            TEXT NOT NULL CHECK (reason IN ('unmatched','underpaid')),
+    related_order_id  UUID REFERENCES orders(id),
+    status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+    notes             TEXT,
+    detected_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at       TIMESTAMPTZ
 );
 
-CREATE INDEX idx_webhook_deliveries_pending ON webhook_deliveries(status, next_attempt_at)
-    WHERE status IN ('pending','failed');
+CREATE UNIQUE INDEX idx_review_items_chain_tx ON review_items(chain, tx_hash);
+CREATE INDEX idx_review_items_open ON review_items(status) WHERE status = 'open';
