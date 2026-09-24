@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS review_items;
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS chain_cursors;
+DROP TABLE IF EXISTS orders;
